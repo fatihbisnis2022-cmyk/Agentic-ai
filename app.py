@@ -4,12 +4,15 @@ import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Any, Callable, Literal
 
 import streamlit as st
-from google import genai
-from google.genai import types
 from pydantic import BaseModel, Field
+
+try:
+    import ollama as ollama_lib
+except ImportError:
+    ollama_lib = None
 
 # ==============================================================================
 # 1. KONFIGURASI & PENYIMPANAN MEMORI JSON (ATOMIC WRITE)
@@ -206,24 +209,29 @@ def baca_ringkasan_memori() -> str:
 
 
 # ==============================================================================
-# 4. PROMPT ENRICHMENT & EKSEKUSI AGEN
+# 4. ADAPTER MESIN AI (GEMINI & OLLAMA PYTHON LIBRARY)
 # ==============================================================================
 class EnrichedPromptResult(BaseModel):
     enriched_prompt: str
     context_used: list[str]
 
 
-def get_genai_client(api_key: str) -> genai.Client:
-    if api_key.strip():
-        return genai.Client(api_key=api_key.strip())
-    return genai.Client()
+def _extract_json_block(text: str) -> str:
+    bersih = text.strip()
+    if bersih.startswith("```"):
+        lines = bersih.splitlines()
+        if len(lines) >= 3:
+            bersih = "\n".join(lines[1:-1]).strip()
+    return bersih
 
 
 def enrich_prompt(
-    client: genai.Client,
+    provider: Literal["Gemini", "Ollama (Library Python)"],
     model_name: str,
     raw_prompt: str,
     memory: AgentMemory,
+    gemini_api_key: str = "",
+    ollama_host: str = "http://localhost:11434",
 ) -> EnrichedPromptResult:
     prefs_str = (
         "\n".join(f"- {k}: {v}" for k, v in memory.preferences.items()) or "- Tidak ada"
@@ -258,88 +266,169 @@ Input Mentah Pengguna:
 "{raw_prompt}"
 """.strip()
 
-    resp = client.models.generate_content(
-        model=model_name,
-        contents=meta_prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=EnrichedPromptResult,
-            temperature=0.2,
-        ),
+    if provider == "Gemini":
+        from google import genai
+        from google.genai import types
+
+        client = (
+            genai.Client(api_key=gemini_api_key.strip())
+            if gemini_api_key.strip()
+            else genai.Client()
+        )
+        resp = client.models.generate_content(
+            model=model_name,
+            contents=meta_prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=EnrichedPromptResult,
+                temperature=0.2,
+            ),
+        )
+        return EnrichedPromptResult.model_validate_json(resp.text)
+
+    if ollama_lib is None:
+        raise RuntimeError(
+            "Library 'ollama' belum terinstal. Tambahkan 'ollama' ke requirements.txt."
+        )
+
+    client_ollama = ollama_lib.Client(
+        host=ollama_host.strip() or "http://localhost:11434"
     )
-    return EnrichedPromptResult.model_validate_json(resp.text)
+    schema_hint = json.dumps(EnrichedPromptResult.model_json_schema(), ensure_ascii=False)
+    prompt_with_schema = (
+        f"{meta_prompt}\n\n"
+        "Balas HANYA dalam format JSON valid yang sesuai dengan skema berikut:\n"
+        f"{schema_hint}"
+    )
+    resp = client_ollama.chat(
+        model=model_name,
+        messages=[{"role": "user", "content": prompt_with_schema}],
+        options={"temperature": 0.2},
+    )
+    raw_content = _extract_json_block(resp.message.content or "{}")
+    return EnrichedPromptResult.model_validate_json(raw_content)
 
 
 def run_agent_turn(
-    client: genai.Client,
+    provider: Literal["Gemini", "Ollama (Library Python)"],
     model_name: str,
     enriched_prompt: str,
     chat_history: list[dict[str, str]],
+    gemini_api_key: str = "",
+    ollama_host: str = "http://localhost:11434",
+    max_steps: int = 5,
 ) -> tuple[str, list[str]]:
     tools_used: list[str] = []
 
-    def tracked_simpan_preferensi(kunci: str, nilai: str) -> str:
-        """Simpan atau perbarui preferensi pengguna ke memori JSON."""
-        tools_used.append(f"simpan_preferensi(kunci='{kunci}', nilai='{nilai}')")
-        return simpan_preferensi(kunci, nilai)
+    def wrap_tool(fn: Callable[..., str], label: str) -> Callable[..., str]:
+        def _inner(**kwargs: Any) -> str:
+            args_repr = ", ".join(f"{k}={repr(v)}" for k, v in kwargs.items())
+            tools_used.append(f"{label}({args_repr})")
+            return fn(**kwargs)
 
-    def tracked_tambah_fakta(fakta: str) -> str:
-        """Simpan fakta, keputusan, atau catatan penting ke memori jangka panjang."""
-        tools_used.append(f"tambah_fakta_memori(fakta='{fakta}')")
-        return tambah_fakta_memori(fakta)
+        _inner.__name__ = fn.__name__
+        _inner.__doc__ = fn.__doc__
+        return _inner
 
-    def tracked_perbarui_tugas(
-        judul: str,
-        status: Literal["pending", "in_progress", "done"],
-        catatan: str = "",
-    ) -> str:
-        """Buat atau perbarui status tugas pada memori JSON."""
-        tools_used.append(f"perbarui_tugas(judul='{judul}', status='{status}')")
-        return perbarui_tugas(judul, status, catatan)
+    tracked_tools = [
+        wrap_tool(simpan_preferensi, "simpan_preferensi"),
+        wrap_tool(tambah_fakta_memori, "tambah_fakta_memori"),
+        wrap_tool(perbarui_tugas, "perbarui_tugas"),
+        wrap_tool(baca_ringkasan_memori, "baca_ringkasan_memori"),
+    ]
+    tool_map = {fn.__name__: fn for fn in tracked_tools}
 
-    def tracked_baca_memori() -> str:
-        """Baca preferensi, fakta, dan daftar tugas yang tersimpan di memori JSON."""
-        tools_used.append("baca_ringkasan_memori()")
-        return baca_ringkasan_memori()
+    system_instruction = (
+        "Kamu adalah asisten Agentic AI yang membantu menyelesaikan tugas secara terstruktur. "
+        "Gunakan tool memori bila pengguna menyampaikan preferensi baru, fakta penting proyek, "
+        "atau progres tugas, maupun saat perlu membaca memori/tugas yang tersimpan. "
+        "Setelah selesai, berikan jawaban akhir yang jelas dan ringkas."
+    )
 
-    contents: list[types.Content] = []
-    for msg in chat_history[-10:]:
-        role = "user" if msg["role"] == "user" else "model"
+    if provider == "Gemini":
+        from google import genai
+        from google.genai import types
+
+        client = (
+            genai.Client(api_key=gemini_api_key.strip())
+            if gemini_api_key.strip()
+            else genai.Client()
+        )
+
+        contents: list[types.Content] = []
+        for msg in chat_history[-10:]:
+            role = "user" if msg["role"] == "user" else "model"
+            contents.append(
+                types.Content(
+                    role=role,
+                    parts=[types.Part.from_text(text=msg["content"])],
+                )
+            )
         contents.append(
             types.Content(
-                role=role,
-                parts=[types.Part.from_text(text=msg["content"])],
+                role="user",
+                parts=[types.Part.from_text(text=enriched_prompt)],
             )
         )
 
-    contents.append(
-        types.Content(
-            role="user",
-            parts=[types.Part.from_text(text=enriched_prompt)],
-        )
-    )
-
-    response = client.models.generate_content(
-        model=model_name,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=(
-                "Kamu adalah asisten Agentic AI yang membantu menyelesaikan tugas secara terstruktur. "
-                "Gunakan tool memori bila pengguna menyampaikan preferensi baru, fakta penting proyek, "
-                "atau progres tugas, maupun saat perlu membaca memori/tugas yang tersimpan. "
-                "Setelah selesai, berikan jawaban akhir yang jelas dan ringkas."
+        response = client.models.generate_content(
+            model=model_name,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                tools=tracked_tools,
+                temperature=0.3,
             ),
-            tools=[
-                tracked_simpan_preferensi,
-                tracked_tambah_fakta,
-                tracked_perbarui_tugas,
-                tracked_baca_memori,
-            ],
-            temperature=0.3,
-        ),
-    )
+        )
+        return response.text or "(Tidak ada respons teks.)", tools_used
 
-    return response.text or "(Tidak ada respons teks.)", tools_used
+    if ollama_lib is None:
+        raise RuntimeError(
+            "Library 'ollama' belum terinstal. Tambahkan 'ollama' ke requirements.txt."
+        )
+
+    client_ollama = ollama_lib.Client(
+        host=ollama_host.strip() or "http://localhost:11434"
+    )
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": system_instruction},
+    ]
+    for msg in chat_history[-10:]:
+        role = "user" if msg["role"] == "user" else "assistant"
+        messages.append({"role": role, "content": msg["content"]})
+    messages.append({"role": "user", "content": enriched_prompt})
+
+    for _ in range(max_steps):
+        resp = client_ollama.chat(
+            model=model_name,
+            messages=messages,
+            tools=tracked_tools,
+            options={"temperature": 0.3},
+        )
+        msg_obj = resp.message
+        messages.append(msg_obj)
+
+        tool_calls = getattr(msg_obj, "tool_calls", None) or []
+        if not tool_calls:
+            return msg_obj.content or "(Tidak ada respons teks.)", tools_used
+
+        for call in tool_calls:
+            fn_name = call.function.name
+            fn_args = call.function.arguments or {}
+            if isinstance(fn_args, str):
+                fn_args = json.loads(fn_args)
+
+            if fn_name in tool_map:
+                try:
+                    result = tool_map[fn_name](**fn_args)
+                except Exception as exc:
+                    result = f"Error menjalankan tool '{fn_name}': {exc}"
+            else:
+                result = f"Tool '{fn_name}' tidak ditemukan."
+
+            messages.append({"role": "tool", "content": str(result)})
+
+    return "Batas langkah agen tercapai sebelum jawaban akhir dihasilkan.", tools_used
 
 
 # ==============================================================================
@@ -361,17 +450,39 @@ default_api_key = get_secret_or_env("GEMINI_API_KEY", "")
 with st.sidebar:
     render_logout_button()
     st.header("⚙️ Pengaturan Agen")
-    api_key_input = st.text_input(
-        "Gemini API Key",
-        value=default_api_key,
-        type="password",
-        help="Otomatis terisi jika GEMINI_API_KEY ada di st.secrets atau environment variable.",
-    )
-    model_name = st.selectbox(
-        "Model Gemini",
-        options=["gemini-2.5-flash", "gemini-2.5-pro"],
+
+    provider = st.selectbox(
+        "Pilih Mesin AI",
+        options=["Gemini", "Ollama (Library Python)"],
         index=0,
     )
+
+    if provider == "Gemini":
+        api_key_input = st.text_input(
+            "Gemini API Key",
+            value=default_api_key,
+            type="password",
+            help="Otomatis terisi jika GEMINI_API_KEY ada di st.secrets atau environment variable.",
+        )
+        ollama_host = "http://localhost:11434"
+        model_name = st.selectbox(
+            "Model Gemini",
+            options=["gemini-2.5-flash", "gemini-2.5-pro"],
+            index=0,
+        )
+    else:
+        api_key_input = ""
+        ollama_host = st.text_input(
+            "Ollama Host URL",
+            value=get_secret_or_env("OLLAMA_HOST", "http://localhost:11434"),
+            help="URL server Ollama yang aktif (lokal atau server/tunnel yang dapat dijangkau).",
+        )
+        model_name = st.text_input(
+            "Nama Model Ollama",
+            value="llama3.2",
+            help="Pastikan model sudah tersedia di server Ollama (mis. llama3.2, qwen2.5).",
+        )
+
     use_enrichment = st.toggle(
         "Aktifkan Prompt Enrichment",
         value=True,
@@ -417,7 +528,7 @@ user_input = st.chat_input(
 
 if user_input:
     effective_key = api_key_input.strip() or get_secret_or_env("GEMINI_API_KEY", "").strip()
-    if not effective_key:
+    if provider == "Gemini" and not effective_key:
         st.error(
             "Masukkan `GEMINI_API_KEY` di sidebar atau atur di `st.secrets` / environment variable `GEMINI_API_KEY`."
         )
@@ -430,12 +541,16 @@ if user_input:
     with st.chat_message("assistant"):
         with st.spinner("Menyempurnakan prompt & menjalankan agen..."):
             try:
-                client = get_genai_client(effective_key)
                 memory_snapshot = load_memory()
 
                 if use_enrichment:
                     enriched_res = enrich_prompt(
-                        client, model_name, user_input, memory_snapshot
+                        provider=provider,
+                        model_name=model_name,
+                        raw_prompt=user_input,
+                        memory=memory_snapshot,
+                        gemini_api_key=effective_key,
+                        ollama_host=ollama_host,
                     )
                     final_prompt = enriched_res.enriched_prompt
                     context_used = enriched_res.context_used
@@ -444,10 +559,12 @@ if user_input:
                     context_used = []
 
                 assistant_reply, tools_used = run_agent_turn(
-                    client=client,
+                    provider=provider,
                     model_name=model_name,
                     enriched_prompt=final_prompt,
                     chat_history=st.session_state.messages[:-1],
+                    gemini_api_key=effective_key,
+                    ollama_host=ollama_host,
                 )
 
                 st.markdown(assistant_reply)
