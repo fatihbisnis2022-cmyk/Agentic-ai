@@ -267,24 +267,19 @@ Input Mentah Pengguna:
 """.strip()
 
     if provider == "Gemini":
-        from google import genai
-        from google.genai import types
-
-        client = (
-            genai.Client(api_key=gemini_api_key.strip())
-            if gemini_api_key.strip()
-            else genai.Client()
+        api_key_input = st.text_input(
+            "Gemini API Key",
+            value=default_api_key,
+            type="password",
+            help="Otomatis terisi jika GEMINI_API_KEY ada di st.secrets atau environment variable.",
         )
-        resp = client.models.generate_content(
-            model=model_name,
-            contents=meta_prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=EnrichedPromptResult,
-                temperature=0.2,
-            ),
+        ollama_host = "http://localhost:11434"
+        model_name = st.text_input(
+            "Model Gemini",
+            value=get_secret_or_env("GEMINI_MODEL", "gemini-3.8-flash"),
+            help="Sesuaikan dengan model aktif dari hasil client.models.list(), mis. gemini-3.8-flash.",
         )
-        return EnrichedPromptResult.model_validate_json(resp.text)
+              (resp.text)
 
     if ollama_lib is None:
         raise RuntimeError(
