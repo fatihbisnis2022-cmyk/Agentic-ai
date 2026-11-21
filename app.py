@@ -225,6 +225,13 @@ def _extract_json_block(text: str) -> str:
     return bersih
 
 
+def _normalize_model_name(name: str) -> str:
+    cleaned = name.strip()
+    if cleaned.startswith("models/"):
+        return cleaned.removeprefix("models/")
+    return cleaned
+
+
 def enrich_prompt(
     provider: Literal["Gemini", "Ollama (Library Python)"],
     model_name: str,
@@ -266,20 +273,27 @@ Input Mentah Pengguna:
 "{raw_prompt}"
 """.strip()
 
+    target_model = _normalize_model_name(model_name)
+
     if provider == "Gemini":
-        api_key_input = st.text_input(
-            "Gemini API Key",
-            value=default_api_key,
-            type="password",
-            help="Otomatis terisi jika GEMINI_API_KEY ada di st.secrets atau environment variable.",
+        from google import genai
+        from google.genai import types
+
+        client = (
+            genai.Client(api_key=gemini_api_key.strip())
+            if gemini_api_key.strip()
+            else genai.Client()
         )
-        ollama_host = "http://localhost:11434"
-        model_name = st.text_input(
-            "Model Gemini",
-            value=get_secret_or_env("GEMINI_MODEL", "gemini-3.8-flash"),
-            help="Sesuaikan dengan model aktif dari hasil client.models.list(), mis. gemini-3.8-flash.",
+        resp = client.models.generate_content(
+            model=target_model,
+            contents=meta_prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=EnrichedPromptResult,
+                temperature=0.2,
+            ),
         )
-              (resp.text)
+        return EnrichedPromptResult.model_validate_json(resp.text)
 
     if ollama_lib is None:
         raise RuntimeError(
@@ -296,7 +310,7 @@ Input Mentah Pengguna:
         f"{schema_hint}"
     )
     resp = client_ollama.chat(
-        model=model_name,
+        model=target_model,
         messages=[{"role": "user", "content": prompt_with_schema}],
         options={"temperature": 0.2},
     )
@@ -340,6 +354,8 @@ def run_agent_turn(
         "Setelah selesai, berikan jawaban akhir yang jelas dan ringkas."
     )
 
+    target_model = _normalize_model_name(model_name)
+
     if provider == "Gemini":
         from google import genai
         from google.genai import types
@@ -367,7 +383,7 @@ def run_agent_turn(
         )
 
         response = client.models.generate_content(
-            model=model_name,
+            model=target_model,
             contents=contents,
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
@@ -395,7 +411,7 @@ def run_agent_turn(
 
     for _ in range(max_steps):
         resp = client_ollama.chat(
-            model=model_name,
+            model=target_model,
             messages=messages,
             tools=tracked_tools,
             options={"temperature": 0.3},
@@ -441,6 +457,7 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 
 default_api_key = get_secret_or_env("GEMINI_API_KEY", "")
+default_gemini_model = get_secret_or_env("GEMINI_MODEL", "gemini-3.8-flash")
 
 with st.sidebar:
     render_logout_button()
@@ -460,10 +477,10 @@ with st.sidebar:
             help="Otomatis terisi jika GEMINI_API_KEY ada di st.secrets atau environment variable.",
         )
         ollama_host = "http://localhost:11434"
-        model_name = st.selectbox(
+        model_name = st.text_input(
             "Model Gemini",
-            options=["gemini-2.5-flash", "gemini-2.5-pro"],
-            index=0,
+            value=default_gemini_model,
+            help="Gunakan nama model aktif (mis. gemini-3.8-flash) sesuai hasil daftar model API key kamu.",
         )
     else:
         api_key_input = ""
